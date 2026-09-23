@@ -1,5 +1,6 @@
 import csv
 import datetime as dt
+import json
 import math
 import os
 import queue
@@ -15,10 +16,11 @@ PUMP_PORT = "COM4"
 BAUD = 9600
 SAMPLE_INTERVAL = 2.0
 SERIAL_TIMEOUT = 1.0
+SETTINGS_FILE = "pump_controller_settings.json"
 
 DEFAULT_CALIBRATION = [
-    {"slope": 0.15000, "intercept": -52.13303},
-    {"slope": 0.15000, "intercept": -52.13303},
+    {"x_calibration": "217, 400, 572", "y_calibration": "4, 7, 10"},
+    {"x_calibration": "217, 400, 572", "y_calibration": "4, 7, 10"},
 ]
 
 DEFAULT_SETTINGS = [
@@ -33,14 +35,70 @@ def send_line(ser, command):
     return ser.readline().decode(errors="replace").strip()
 
 
+def parse_calibration_values(text, field_name):
+    """Parse a comma-separated numeric calibration series, ignoring surrounding spaces."""
+    try:
+        values = [float(item.strip()) for item in text.split(",")]
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be comma-separated numbers.") from exc
+
+    if len(values) < 2 or any(not math.isfinite(value) for value in values):
+        raise ValueError(f"{field_name} must contain at least two finite numbers.")
+    return values
+
+
+def calculate_linear_calibration(x_values, y_values):
+    """Return least-squares slope and intercept for pH = slope * raw + intercept."""
+    if len(x_values) != len(y_values):
+        raise ValueError("X calibration and Y calibration must contain the same number of values.")
+
+    n = len(x_values)
+    x_mean = sum(x_values) / n
+    y_mean = sum(y_values) / n
+    denominator = sum((x - x_mean) ** 2 for x in x_values)
+    if denominator == 0:
+        raise ValueError("X calibration values must not all be identical.")
+
+    slope = sum((x - x_mean) * (y - y_mean) for x, y in zip(x_values, y_values)) / denominator
+    intercept = y_mean - slope * x_mean
+    return slope, intercept
+
+
+def load_saved_gui_settings():
+    defaults = {
+        "geometry": "980x720",
+        "pumps": [
+            {**DEFAULT_SETTINGS[i], **DEFAULT_CALIBRATION[i]}
+            for i in range(2)
+        ],
+    }
+    if not os.path.exists(SETTINGS_FILE):
+        return defaults
+
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if not isinstance(saved, dict) or not isinstance(saved.get("pumps"), list):
+            raise ValueError("Invalid settings file structure")
+
+        geometry = saved.get("geometry", defaults["geometry"])
+        pumps = []
+        for i in range(2):
+            pump_data = saved["pumps"][i] if i < len(saved["pumps"]) else {}
+            pumps.append({**defaults["pumps"][i], **pump_data})
+        return {"geometry": geometry, "pumps": pumps}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return defaults
+
+
 class Controller(threading.Thread):
-    def __init__(self, commands, events):
+    def __init__(self, commands, events, settings, calibration):
         super().__init__(daemon=True)
         self.commands = commands
         self.events = events
         self.stop_event = threading.Event()
-        self.settings = [dict(x) for x in DEFAULT_SETTINGS]
-        self.calibration = [dict(x) for x in DEFAULT_CALIBRATION]
+        self.settings = [dict(x) for x in settings]
+        self.calibration = [dict(x) for x in calibration]
         self.next_dose = [0.0, 0.0]
         self.pump_on = [False, False]
         self.latest = [{"raw": None, "ph": None}, {"raw": None, "ph": None}]
@@ -83,7 +141,11 @@ class Controller(threading.Thread):
             elif kind == "calibration":
                 pump = command["pump"]
                 self.calibration[pump].update(command["values"])
-                self.emit("log", text=f"Probe {pump + 1} calibration updated.")
+                self.emit("log", text=(
+                    f"Probe {pump + 1} calibration updated: "
+                    f"slope {self.calibration[pump]['slope']:.6f}, "
+                    f"intercept {self.calibration[pump]['intercept']:.6f}."
+                ))
 
             elif kind == "mode":
                 pump = command["pump"]
@@ -124,17 +186,27 @@ class Controller(threading.Thread):
                 csv.writer(f).writerow([
                     "time", "raw0", "ph0", "raw1", "ph1",
                     "pump0_mode", "pump0_speed", "pump0_target",
+                    "pump0_dose_s", "pump0_redose_delay_s",
+                    "pump0_x_calibration", "pump0_y_calibration",
+                    "pump0_slope", "pump0_intercept",
                     "pump1_mode", "pump1_speed", "pump1_target",
+                    "pump1_dose_s", "pump1_redose_delay_s",
+                    "pump1_x_calibration", "pump1_y_calibration",
+                    "pump1_slope", "pump1_intercept",
                 ])
 
     def log_reading(self):
+        c0, c1 = self.calibration
+        s0, s1 = self.settings
         with open(self.log_file, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow([
                 dt.datetime.now().isoformat(timespec="seconds"),
                 self.latest[0]["raw"], self.latest[0]["ph"],
                 self.latest[1]["raw"], self.latest[1]["ph"],
-                self.settings[0]["mode"], self.settings[0]["speed"], self.settings[0]["target"],
-                self.settings[1]["mode"], self.settings[1]["speed"], self.settings[1]["target"],
+                s0["mode"], s0["speed"], s0["target"], s0["dose"], s0["delay"],
+                c0["x_calibration"], c0["y_calibration"], c0["slope"], c0["intercept"],
+                s1["mode"], s1["speed"], s1["target"], s1["dose"], s1["delay"],
+                c1["x_calibration"], c1["y_calibration"], c1["slope"], c1["intercept"],
             ])
 
     def auto_dose(self, pump):
@@ -162,7 +234,7 @@ class Controller(threading.Thread):
     def run(self):
         try:
             with serial.Serial(PROBE_PORT, BAUD, timeout=SERIAL_TIMEOUT) as probe_ser, \
-                 serial.Serial(PUMP_PORT, BAUD, timeout=SERIAL_TIMEOUT) as self.pump_ser:
+                    serial.Serial(PUMP_PORT, BAUD, timeout=SERIAL_TIMEOUT) as self.pump_ser:
                 time.sleep(2.0)
                 self.stop_pumps()
                 self.prepare_log()
@@ -199,13 +271,15 @@ class Controller(threading.Thread):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
+        saved = load_saved_gui_settings()
         self.title("Two-Pump pH Controller")
-        self.geometry("980x720")
+        self.geometry(saved["geometry"])
         self.protocol("WM_DELETE_WINDOW", self.close)
 
         self.commands = queue.Queue()
         self.events = queue.Queue()
         self.controller = None
+        self.saved_pumps = saved["pumps"]
 
         self.status = tk.StringVar(value="Not connected")
         self.log = tk.StringVar(value="Configure settings, then click Start.")
@@ -249,14 +323,15 @@ class App(tk.Tk):
     def build_pump_panel(self, parent, pump):
         frame = ttk.LabelFrame(parent, text=f"Pump {pump + 1} / Probe {pump + 1}", padding=10)
         frame.pack(side="left", fill="both", expand=True, padx=5)
+        saved = self.saved_pumps[pump]
 
         values = {
-            "target": tk.StringVar(value=str(DEFAULT_SETTINGS[pump]["target"])),
-            "dose": tk.StringVar(value=str(DEFAULT_SETTINGS[pump]["dose"])),
-            "delay": tk.StringVar(value=str(DEFAULT_SETTINGS[pump]["delay"])),
-            "speed": tk.StringVar(value=str(DEFAULT_SETTINGS[pump]["speed"])),
-            "slope": tk.StringVar(value=str(DEFAULT_CALIBRATION[pump]["slope"])),
-            "intercept": tk.StringVar(value=str(DEFAULT_CALIBRATION[pump]["intercept"])),
+            "target": tk.StringVar(value=str(saved["target"])),
+            "dose": tk.StringVar(value=str(saved["dose"])),
+            "delay": tk.StringVar(value=str(saved["delay"])),
+            "speed": tk.StringVar(value=str(saved["speed"])),
+            "y_calibration": tk.StringVar(value=str(saved["y_calibration"])),
+            "x_calibration": tk.StringVar(value=str(saved["x_calibration"])),
             "ph": tk.StringVar(value="--"),
             "raw": tk.StringVar(value="--"),
         }
@@ -272,12 +347,13 @@ class App(tk.Tk):
             ("Dose time (s)", "dose"),
             ("Redose delay (s)", "delay"),
             ("PWM speed (0-255)", "speed"),
-            ("Calibration slope", "slope"),
-            ("Calibration intercept", "intercept"),
+            ("Y calibration (pH)", "y_calibration"),
+            ("X calibration (raw)", "x_calibration"),
         ]
         for row, (label, key) in enumerate(fields, start=2):
             ttk.Label(frame, text=label + ":").grid(row=row, column=0, sticky="w", pady=2)
-            ttk.Entry(frame, textvariable=values[key], width=14).grid(row=row, column=1, sticky="w", pady=2)
+            width = 24 if key in ("x_calibration", "y_calibration") else 14
+            ttk.Entry(frame, textvariable=values[key], width=width).grid(row=row, column=1, sticky="w", pady=2)
 
         ttk.Button(frame, text="Apply settings", command=lambda p=pump: self.apply(p)).grid(
             row=8, column=0, columnspan=2, sticky="ew", pady=(8, 4)
@@ -295,41 +371,89 @@ class App(tk.Tk):
 
     def numeric_values(self, pump):
         v = self.vars[pump]
-        values = {
-            "target": float(v["target"].get()),
-            "dose": float(v["dose"].get()),
-            "delay": float(v["delay"].get()),
-            "speed": int(v["speed"].get()),
-            "slope": float(v["slope"].get()),
-            "intercept": float(v["intercept"].get()),
-        }
+        try:
+            values = {
+                "target": float(v["target"].get()),
+                "dose": float(v["dose"].get()),
+                "delay": float(v["delay"].get()),
+                "speed": int(v["speed"].get()),
+            }
+        except ValueError as exc:
+            raise ValueError("Target, dose, delay, and speed must be numeric.") from exc
+
+        x_values = parse_calibration_values(v["x_calibration"].get(), "X calibration")
+        y_values = parse_calibration_values(v["y_calibration"].get(), "Y calibration")
+        slope, intercept = calculate_linear_calibration(x_values, y_values)
+
         if not all(math.isfinite(x) for x in values.values() if isinstance(x, float)):
             raise ValueError("Values must be finite.")
         if values["dose"] <= 0 or values["delay"] < 0 or not 0 <= values["speed"] <= 255:
             raise ValueError("Dose must be > 0, delay >= 0, and PWM speed must be 0-255.")
+
+        values.update({
+            "x_calibration": v["x_calibration"].get().strip(),
+            "y_calibration": v["y_calibration"].get().strip(),
+            "slope": slope,
+            "intercept": intercept,
+        })
         return values
+
+    def collect_saved_pump_settings(self):
+        pumps = []
+        for pump in range(2):
+            v = self.vars[pump]
+            pumps.append({
+                "target": v["target"].get(),
+                "dose": v["dose"].get(),
+                "delay": v["delay"].get(),
+                "speed": v["speed"].get(),
+                "mode": self.saved_pumps[pump].get("mode", "off"),
+                "x_calibration": v["x_calibration"].get(),
+                "y_calibration": v["y_calibration"].get(),
+            })
+        return pumps
+
+    def save_gui_settings(self):
+        payload = {
+            "geometry": self.geometry(),
+            "pumps": self.collect_saved_pump_settings(),
+        }
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except OSError as exc:
+            messagebox.showwarning("Settings not saved", f"Could not save GUI settings:\n{exc}")
 
     def apply(self, pump):
         try:
             values = self.numeric_values(pump)
         except ValueError as exc:
             messagebox.showerror("Invalid settings", str(exc))
-            return
+            return False
+
+        self.saved_pumps[pump].update({
+            key: values[key]
+            for key in ("target", "dose", "delay", "speed", "x_calibration", "y_calibration")
+        })
         self.send({"type": "settings", "pump": pump, "values": {
             key: values[key] for key in ("target", "dose", "delay", "speed")
         }})
         self.send({"type": "calibration", "pump": pump, "values": {
-            key: values[key] for key in ("slope", "intercept")
+            key: values[key] for key in ("x_calibration", "y_calibration", "slope", "intercept")
         }})
-        self.log.set(f"Pump {pump + 1} settings saved.")
+        self.log.set(
+            f"Pump {pump + 1} settings saved; pH = {values['slope']:.6f} × raw + {values['intercept']:.6f}."
+        )
+        return True
 
     def set_mode(self, pump, mode):
-        self.apply(pump)
-        self.send({"type": "mode", "pump": pump, "mode": mode})
+        if self.apply(pump):
+            self.saved_pumps[pump]["mode"] = mode
+            self.send({"type": "mode", "pump": pump, "mode": mode})
 
     def test(self, pump):
-        self.apply(pump)
-        self.send({"type": "test", "pump": pump})
+        if self.apply(pump):
+            self.send({"type": "test", "pump": pump})
 
     def send(self, command):
         if self.controller and self.controller.is_alive():
@@ -340,16 +464,24 @@ class App(tk.Tk):
     def start(self):
         if self.controller and self.controller.is_alive():
             return
+
+        settings = []
+        calibration = []
         for pump in range(2):
             try:
-                self.numeric_values(pump)
+                values = self.numeric_values(pump)
             except ValueError as exc:
                 messagebox.showerror("Invalid settings", f"Pump {pump + 1}: {exc}")
                 return
-        self.controller = Controller(self.commands, self.events)
+            settings.append({key: values[key] for key in ("target", "dose", "delay", "speed")})
+            calibration.append({
+                key: values[key]
+                for key in ("x_calibration", "y_calibration", "slope", "intercept")
+            })
+            self.saved_pumps[pump].update({**settings[-1], **calibration[-1]})
+
+        self.controller = Controller(self.commands, self.events, settings, calibration)
         self.controller.start()
-        for pump in range(2):
-            self.apply(pump)
         self.status.set("Opening serial ports...")
 
     def process_events(self):
@@ -385,6 +517,7 @@ class App(tk.Tk):
         self.after(100, self.process_events)
 
     def close(self):
+        self.save_gui_settings()
         if self.controller and self.controller.is_alive():
             self.commands.put({"type": "shutdown"})
             self.after(300, self.destroy)
